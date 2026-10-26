@@ -1,0 +1,18 @@
+[package]
+name = "postvim"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
+tempfile = "3.27"
+
+[[test]]
+name = "terminal_lifecycle_fixture"
+harness = false
