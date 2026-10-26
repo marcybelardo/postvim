@@ -46,7 +46,7 @@ PROMPT_CURSOR = b"\x1b[4 q"
 # SGR/CSI sequences only; this is not a screen model, just a way to read the
 # text of a fresh output slice without the style bytes that split cells.
 ANSI_SEQUENCE = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]")
-# The dirty-quit refusal, as documented in README.md and docs/keymaps.md.
+# The dirty-quit refusal, as documented in AGENTS.md and docs/keymaps.md.
 DOCUMENTED_DIRTY_MESSAGE = (
     "Unsaved changes; use :w [path] before :q, or :q! to discard"
 )

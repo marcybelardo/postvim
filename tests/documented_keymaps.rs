@@ -1,6 +1,6 @@
 //! Contract tests for the documented keymap.
 //!
-//! `README.md` and `docs/keymaps.md` are user-facing promises. These tests keep
+//! `AGENTS.md` and `docs/keymaps.md` record the editing contract. These tests keep
 //! those promises, `--help`, and the editor itself from drifting apart: the key
 //! inventory and Ex command list are pinned, and every example printed in the
 //! keymap page is executed against the editor.
@@ -11,9 +11,9 @@ use postvim::cli::HELP;
 use postvim::{Document, Editor, EditorInput, EditorMode};
 
 const KEYMAP: &str = include_str!("../docs/keymaps.md");
-const README: &str = include_str!("../README.md");
+const AGENTS: &str = include_str!("../AGENTS.md");
 
-/// The dirty-quit sentence the README and keymap page both promise.
+/// The dirty-quit sentence the agent guide and keymap page both promise.
 const DOCUMENTED_DIRTY_MESSAGE: &str =
     "Unsaved changes; use :w [path] before :q, or :q! to discard";
 
@@ -290,13 +290,13 @@ fn help_matches_save_exit_contract() {
     }
     for command in [":w", ":q", ":q!", ":wq", ":x"] {
         assert!(
-            README.contains(command),
-            "README.md must document {command:?}"
+            AGENTS.contains(command),
+            "AGENTS.md must document {command:?}"
         );
     }
     assert!(
-        README.contains(":w <path>"),
-        "README.md must document the path form of :w"
+        AGENTS.contains(":w <path>"),
+        "AGENTS.md must document the path form of :w"
     );
     for claim in ["discards", "modified"] {
         assert!(
@@ -308,15 +308,15 @@ fn help_matches_save_exit_contract() {
         assert!(!HELP.contains(stale), "--help still claims {stale:?}");
     }
     assert!(
-        README.contains(DOCUMENTED_DIRTY_MESSAGE),
-        "README.md must state the dirty-quit message exactly"
+        AGENTS.contains(DOCUMENTED_DIRTY_MESSAGE),
+        "AGENTS.md must state the dirty-quit message exactly"
     );
     assert!(
         KEYMAP.contains(DOCUMENTED_DIRTY_MESSAGE),
         "docs/keymaps.md must state the dirty-quit message exactly"
     );
     assert!(
-        README.contains("docs/keymaps.md"),
-        "README.md must point at the keymap contract"
+        AGENTS.contains("docs/keymaps.md"),
+        "AGENTS.md must point at the keymap contract"
     );
 }
