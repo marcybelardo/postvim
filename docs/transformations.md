@@ -153,6 +153,36 @@ Because the request carries text rather than a live buffer, callers decide how a
 result reaches a particular document, and a caller that has moved on can detect
 that its result is stale instead of clobbering newer edits.
 
+## Design direction (not yet implemented)
+
+The long-term direction is for Postvim to be agnostic to an operation's task.
+Formatting is the first adapter, not the permanent conceptual category. An
+operation would request text or explicitly supported context; Postvim would
+supply it and receive an edit, information, or failure. Postvim would own
+document/context access, stale-source validation, edit application, undo,
+presentation, and explicit persistence. The operation would own task-specific
+meaning. Context provision must be explicit, not unrestricted ambient access;
+this boundary would not sandbox a trusted external program. Independent CLI,
+library, and editor clients do not share unsaved session state. The current
+formatter API and commands remain as documented above, and the current trust
+and synchronous-process limits remain unchanged.
+
+The recommended next bounded experiment—not an approved feature implementation
+plan—is to run an explicitly selected stdin/stdout tool on a whole document or
+selection in an information-only mode, using `wc -w` as a concrete example. Its
+successful output would be presented as information, not replacement text. The
+buffer, dirty baseline, undo/redo history, and file would remain unchanged by
+Postvim. This would reuse direct execution and sanitized presentation, not add
+word-count-specific logic; a trusted program's own side effects would still be
+outside Postvim's control.
+
+A caller-declared result intent would be enough for that experiment. The useful
+result distinction is edit versus information, not format versus explain, count,
+or translate. No new command or API spelling is specified here, nor dynamic
+context negotiation, a plugin manifest, registry, discovery, loading, panels,
+asynchronous scheduling, or a general protocol. Today's tools do not negotiate
+context or return typed information results through the formatter API.
+
 ## Diagnostics for people
 
 The editor and the command line present formatter diagnostics the same way: they
