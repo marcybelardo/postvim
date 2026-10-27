@@ -1,12 +1,27 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::document::{CapturedLine, Cursor, Document, Register};
 use crate::keymap::{self, InsertEntry, Operator, Parser, ReplaceTarget, Step};
 use crate::motion::{self, FindKind, MotionRange, MotionSpec};
-use crate::storage;
+use crate::storage::{self, DiskContents, Observation, SaveError};
+use crate::transform::{
+    ByteRange, FormatterSpec, TransformError, TransformRequest, TransformSource,
+};
+
+/// How long two equivalent disk samples must be apart before a change is shown
+/// or applied. This is a heuristic that hides ordinary truncate-then-write
+/// gaps; it is not a proof that a foreign writer has finished.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Persistent status while a foreign edit and local text disagree.
+const CONFLICT_STATUS: &str = "Disk changed externally; :reload! discards local edits";
+
+/// Persistent status while a clean buffer waits for an idle Normal boundary.
+const PENDING_STATUS: &str = "External change on disk; waiting for idle to reload";
 
 /// Interactive mode. Rendering and cursor style follow this value; the editor
 /// owns exactly one of these at a time.
@@ -161,6 +176,40 @@ struct InsertSession {
     dot: InsertDot,
 }
 
+/// One sample of the active file, reduced to the facts reconciliation needs.
+///
+/// Samples are compared only with other samples, so equal-looking but distinct
+/// reads of the same state confirm each other.
+#[derive(Clone, Debug)]
+enum DiskProbe {
+    /// A readable destination holding UTF-8-compatible bytes, or nothing at all.
+    Readable(Observation),
+    /// A readable destination whose bytes are not valid UTF-8.
+    NotUtf8(Observation),
+    /// The destination could not be inspected.
+    Failed(io::ErrorKind),
+}
+
+impl DiskProbe {
+    fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Readable(this), Self::Readable(that))
+            | (Self::NotUtf8(this), Self::NotUtf8(that)) => {
+                this.destination == that.destination && this.contents == that.contents
+            }
+            (Self::Failed(this), Self::Failed(that)) => this == that,
+            _ => false,
+        }
+    }
+}
+
+/// Position in time of the first of two equivalent disk samples.
+#[derive(Clone, Debug)]
+struct StableSample {
+    probe: DiskProbe,
+    at: Instant,
+}
+
 /// A normalized, position-independent Visual selection shape.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VisualShape {
@@ -197,10 +246,19 @@ enum VisualCommand {
     Delete,
     Change,
     Yank,
-    Put { before: bool },
+    Put {
+        before: bool,
+    },
     Toggle(SelectionKind),
-    Search { forward: bool },
-    SearchNext { reverse: bool },
+    Search {
+        forward: bool,
+    },
+    SearchNext {
+        reverse: bool,
+    },
+    /// `:` from a Visual selection; the prompt keeps the selection for range
+    /// commands such as `:format`.
+    CommandPrompt,
 }
 
 fn visual_command(ch: char) -> Option<VisualCommand> {
@@ -216,6 +274,7 @@ fn visual_command(ch: char) -> Option<VisualCommand> {
         '?' => Some(VisualCommand::Search { forward: false }),
         'n' => Some(VisualCommand::SearchNext { reverse: false }),
         'N' => Some(VisualCommand::SearchNext { reverse: true }),
+        ':' => Some(VisualCommand::CommandPrompt),
         _ => None,
     }
 }
@@ -235,6 +294,21 @@ pub struct Editor {
     command_return: Option<PromptReturn>,
     message: Option<String>,
     saved: String,
+    /// Expected disk state for the active path: the bytes and resolved
+    /// destination captured when the file was opened, last written
+    /// successfully, or last reloaded.
+    ///
+    /// Kept separate from `saved` on purpose: a foreign edit must never advance
+    /// this baseline, or it would authorize the very overwrite it warns about.
+    /// `Some` exactly when `path` is `Some`.
+    disk: Option<Observation>,
+    /// Persistent external-change status for the status line. Unlike `message`
+    /// it survives input, so a conflict stays visible while the user types.
+    external: Option<String>,
+    /// When the most recent disk sample was taken.
+    last_sample: Option<Instant>,
+    /// First of two equivalent samples awaiting confirmation.
+    stable_candidate: Option<StableSample>,
     should_quit: bool,
     preferred_visual_column: Option<usize>,
     welcome: bool,
@@ -251,13 +325,24 @@ pub struct Editor {
 
 impl Editor {
     pub fn new(path: Option<PathBuf>) -> io::Result<Self> {
-        let content = match path.as_deref() {
-            Some(path) => storage::read_document(path)?,
-            None => String::new(),
+        let Some(path) = path else {
+            let document = Document::new();
+            let saved = document.serialize();
+            return Ok(Self::from_state(document, None, saved));
+        };
+        // One logical read supplies both the text and the expectation, so the
+        // baseline can never describe a moment the text did not come from.
+        let observation = storage::observe(&path)?;
+        let content = match &observation.contents {
+            DiskContents::Missing => String::new(),
+            DiskContents::Present(bytes) => String::from_utf8(bytes.clone())
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
         };
         let document = Document::from_text(&content);
         let saved = document.serialize();
-        Ok(Self::from_state(document, path, saved))
+        let mut editor = Self::from_state(document, Some(path), saved);
+        editor.disk = Some(observation);
+        Ok(editor)
     }
 
     pub fn from_document(document: Document) -> Self {
@@ -278,6 +363,10 @@ impl Editor {
             command_return: None,
             message: None,
             saved,
+            disk: None,
+            external: None,
+            last_sample: None,
+            stable_candidate: None,
             should_quit: false,
             preferred_visual_column: None,
             welcome: true,
@@ -307,6 +396,28 @@ impl Editor {
 
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    /// Persistent external-change status for the active file.
+    ///
+    /// Unlike [`Editor::message`], which input clears, this stays visible while
+    /// the file and the buffer disagree, and while a clean buffer waits for an
+    /// idle boundary. `None` means the last observation matched the baseline.
+    pub fn external_status(&self) -> Option<&str> {
+        self.external.as_deref()
+    }
+
+    /// When the next [`Editor::poll_disk`] call can do work, if the editor polls
+    /// at all. Advisory: the event loop may call `poll_disk` earlier, which
+    /// simply reports no change.
+    pub fn next_poll_at(&self) -> Option<Instant> {
+        if self.path.is_none() || self.disk.is_none() || self.should_quit {
+            return None;
+        }
+        Some(match self.last_sample {
+            Some(last) => last + POLL_INTERVAL,
+            None => Instant::now(),
+        })
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -1252,6 +1363,7 @@ impl Editor {
             VisualCommand::Toggle(kind) => self.toggle_visual(kind),
             VisualCommand::Search { forward } => self.open_search(forward, None),
             VisualCommand::SearchNext { reverse } => self.repeat_search(reverse, None),
+            VisualCommand::CommandPrompt => self.open_command(),
         }
     }
 
@@ -1772,6 +1884,279 @@ impl Editor {
         }
     }
 
+    // ------------------------------------------------------ disk reconciliation
+
+    /// Samples the active file and reconciles a confirmed external change.
+    ///
+    /// Returns `true` when anything observable changed, so the event loop can
+    /// skip a redraw when nothing happened. Reads happen at most once per
+    /// [`POLL_INTERVAL`], and a change is reported or applied only after two
+    /// equivalent samples at least one interval apart, which hides ordinary
+    /// truncate-then-write gaps without claiming to detect every partial write.
+    ///
+    /// Reconciliation never edits a dirty buffer, never advances the expected
+    /// disk state from a foreign observation, and installs a reload only for a
+    /// clean buffer at an idle Normal boundary.
+    pub fn poll_disk(&mut self, now: Instant) -> bool {
+        if self.should_quit || self.disk.is_none() {
+            return false;
+        }
+        let Some(path) = self.path.clone() else {
+            return false;
+        };
+        if let Some(last) = self.last_sample
+            && now.saturating_duration_since(last) < POLL_INTERVAL
+        {
+            return false;
+        }
+        self.last_sample = Some(now);
+        let probe = sample_disk(&path);
+        // The disk is only trusted once it has looked the same twice, one
+        // interval apart; a single sample is cached for the next comparison.
+        let confirmed = matches!(
+            &self.stable_candidate,
+            Some(candidate)
+                if now.saturating_duration_since(candidate.at) >= POLL_INTERVAL
+                    && candidate.probe.same_as(&probe)
+        );
+        self.stable_candidate = None;
+        if !confirmed {
+            self.stable_candidate = Some(StableSample { probe, at: now });
+            return false;
+        }
+        self.reconcile_sample(probe)
+    }
+
+    fn reconcile_sample(&mut self, probe: DiskProbe) -> bool {
+        let prior_status = self.external.clone();
+        let text_changed = match probe {
+            DiskProbe::Readable(observation) => self.reconcile_contents(observation),
+            DiskProbe::NotUtf8(_) => {
+                // Bytes we cannot parse are reported, never installed, so last
+                // good text and baseline survive.
+                self.external =
+                    Some("Disk changed externally; contents are not valid UTF-8".to_owned());
+                false
+            }
+            DiskProbe::Failed(kind) => {
+                self.external = Some(format!("Disk unavailable: {}", failure_reason(kind)));
+                false
+            }
+        };
+        text_changed || self.external != prior_status
+    }
+
+    /// Reconciles a readable observation with the expected disk state.
+    ///
+    /// Returns whether the buffer text or history changed.
+    fn reconcile_contents(&mut self, observation: Observation) -> bool {
+        let Some(expected) = self.disk.as_ref() else {
+            return false;
+        };
+        let same_bytes = expected.contents == observation.contents;
+        let same_target = expected.destination == observation.destination;
+        if same_bytes && same_target {
+            // The common case: nothing happened. Clearing a stale status is the
+            // only work, and no history or baseline moves.
+            self.external = None;
+            return false;
+        }
+        if same_bytes {
+            // Same bytes at a new destination: an alias was retargeted, or an
+            // identical file replaced the old one. The text is unaffected, so
+            // only the destination a later save must match may be refreshed, and
+            // only from an idle clean buffer. Anything else is reported like any
+            // other external change instead of passing silently: a dirty buffer
+            // is a conflict, and a clean buffer mid-sequence is deferred.
+            if self.is_dirty() {
+                self.external = Some(CONFLICT_STATUS.to_owned());
+            } else if self.at_reload_boundary() {
+                self.disk = Some(observation);
+                self.external = None;
+                self.stable_candidate = None;
+            } else {
+                self.external = Some(PENDING_STATUS.to_owned());
+            }
+            return false;
+        }
+        match &observation.contents {
+            DiskContents::Missing => {
+                // Deletion is an unavailable file, not an empty document: keep
+                // the last good text and baseline.
+                self.external = Some("Disk unavailable: file was removed".to_owned());
+                false
+            }
+            DiskContents::Present(bytes) => {
+                let text = std::str::from_utf8(bytes)
+                    .expect("probe validated UTF-8")
+                    .to_owned();
+                if self.is_dirty() {
+                    // Foreign bytes never authorize an overwrite and never
+                    // replace local work.
+                    self.external = Some(CONFLICT_STATUS.to_owned());
+                    return false;
+                }
+                if !self.at_reload_boundary() {
+                    // A clean buffer that is mid-sequence, selecting, prompting
+                    // or inserting is reconciled again at the next boundary.
+                    self.external = Some(PENDING_STATUS.to_owned());
+                    return false;
+                }
+                let changed = self.install_reload(observation, &text);
+                self.message = Some("Reloaded changed file from disk".to_owned());
+                changed
+            }
+        }
+    }
+
+    /// Whether the buffer is at an idle Normal boundary where installing new
+    /// text cannot discard parser state, a selection, a prompt, or an Insert
+    /// session that is still open.
+    fn at_reload_boundary(&self) -> bool {
+        self.mode == EditorMode::Normal
+            && self.parser.is_idle()
+            && self.visual.is_none()
+            && self.insert.is_none()
+            && self.command_return.is_none()
+            && self.search_prompt.is_none()
+            && !self.transaction_open
+            && !self.replaying
+            && self.prompt.is_empty()
+    }
+
+    /// Replaces the buffer with `text` and makes it the saved baseline and the
+    /// expected disk state.
+    ///
+    /// Returns whether the text changed; only a real change records one undo
+    /// step, clears redo and drops the stale dot recipe. Undo restores the older
+    /// text while the disk baseline stays at the reloaded bytes, so undo never
+    /// writes the file and the undone text reads as unsaved.
+    fn install_reload(&mut self, observation: Observation, text: &str) -> bool {
+        let document = Document::from_text(text);
+        let changed = document != self.document;
+        if changed {
+            self.undo.push(Snapshot {
+                document: std::mem::replace(&mut self.document, document),
+                cursor: self.cursor,
+            });
+            self.redo.clear();
+            self.dot = None;
+        } else {
+            self.document = document;
+        }
+        self.saved = self.document.serialize();
+        self.disk = Some(observation);
+        self.external = None;
+        self.stable_candidate = None;
+        self.last_sample = None;
+        self.mode = EditorMode::Normal;
+        self.visual = None;
+        self.prompt.clear();
+        self.command_return = None;
+        self.search_prompt = None;
+        self.insert = None;
+        self.transaction_open = false;
+        self.preferred_visual_column = None;
+        self.parser.reset();
+        self.clamp_cursor_normal();
+        changed
+    }
+
+    // ------------------------------------------------------------- save paths
+
+    /// Whether `candidate` names the file this buffer is already editing.
+    ///
+    /// The comparison is lexical and target-based rather than an exact string
+    /// match, so `./file`, an absolute path, and a symlink alias all keep the
+    /// active baseline. A candidate is an alias when any of these hold:
+    ///
+    /// 1. its normalized spelling equals the active spelling;
+    /// 2. its normalized spelling equals the destination stored in the active
+    ///    expectation, which is the literal target that was opened or written;
+    /// 3. it resolves to that stored destination, so another name for the old
+    ///    target still uses the old baseline even if the active path moved;
+    /// 4. it resolves to the destination the active path resolves to right now,
+    ///    which covers a sibling alias of a retargeted active path; or
+    /// 5. the active path's current destination is the candidate's own spelling,
+    ///    which covers a candidate that has since disappeared.
+    ///
+    /// Rules 4 and 5 are what stop a retargeted active path from handing another
+    /// name a fresh save-as expectation: every name that points where the active
+    /// path points is written through the baseline captured at open. Deliberately
+    /// conservative: a retargeted or deleted active path still matches its own
+    /// spelling, so a conflict cannot be escaped by respelling the destination.
+    fn is_active_alias(&self, candidate: &Path) -> bool {
+        let (Some(active), Some(expected)) = (self.path.as_deref(), self.disk.as_ref()) else {
+            return false;
+        };
+        let Ok(candidate_key) = storage::normalize_path(candidate) else {
+            return false;
+        };
+        if storage::normalize_path(active).is_ok_and(|key| key == candidate_key) {
+            return true;
+        }
+        if storage::normalize_path(&expected.destination).is_ok_and(|key| key == candidate_key) {
+            return true;
+        }
+        let candidate_target = storage::resolve_destination(candidate).ok();
+        let active_target = storage::resolve_destination(active).ok();
+        if let (Some(candidate_destination), Some(active_destination)) =
+            (&candidate_target, &active_target)
+            && candidate_destination == active_destination
+        {
+            return true;
+        }
+        if candidate_target.is_some_and(|resolved| resolved == expected.destination) {
+            return true;
+        }
+        active_target.is_some_and(|resolved| resolved == candidate_key)
+    }
+
+    fn save_to(&mut self, path: PathBuf) -> bool {
+        let bytes = self.document.serialize();
+        // The alias decision is made before anything is adopted or mutated.
+        let expectation = if self.is_active_alias(&path) {
+            match self.disk.clone() {
+                Some(expectation) => expectation,
+                None => match storage::observe(&path) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        self.message = Some(format!("Write failed: {error}"));
+                        return false;
+                    }
+                },
+            }
+        } else {
+            // A save-as target carries its own expectation, captured as the save
+            // begins; unrelated destination bytes are never compared with the
+            // active file's baseline.
+            match storage::observe(&path) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    self.message = Some(format!("Write failed: {error}"));
+                    return false;
+                }
+            }
+        };
+        match storage::save_document_guarded(&path, bytes.as_bytes(), &expectation) {
+            Ok(committed) => {
+                self.path = Some(path);
+                self.saved = bytes;
+                self.disk = Some(committed);
+                self.external = None;
+                self.stable_candidate = None;
+                self.last_sample = None;
+                self.message = Some("Written".to_owned());
+                true
+            }
+            Err(error) => {
+                // The buffer, path, dirty state and old expectation survive.
+                self.message = Some(save_failure_message(&error));
+                false
+            }
+        }
+    }
+
     // -------------------------------------------------------------------- Ex
 
     fn execute_command(&mut self, text: &str) {
@@ -1784,6 +2169,8 @@ impl Editor {
             "w" => self.save_active(),
             "q" => self.quit_without_force(),
             "q!" => self.should_quit = true,
+            "reload" => self.reload_file(false),
+            "reload!" => self.reload_file(true),
             "wq" => {
                 if self.save_active_ok() {
                     self.should_quit = true;
@@ -1794,13 +2181,203 @@ impl Editor {
                     self.should_quit = true;
                 }
             }
-            _ => match write_path_argument(command) {
-                Some(path) if !path.is_empty() => {
-                    self.save_to(PathBuf::from(path));
+            _ => {
+                if let Some(rest) = format_command_text(command) {
+                    self.format_text(rest);
+                } else {
+                    match write_path_argument(command) {
+                        Some(path) if !path.is_empty() => {
+                            self.save_to(PathBuf::from(path));
+                        }
+                        Some(_) => self.message = Some("No filename; use :w <path>".to_owned()),
+                        None => self.message = Some(format!("Unknown command: {command}")),
+                    }
                 }
-                Some(_) => self.message = Some("No filename; use :w <path>".to_owned()),
-                None => self.message = Some(format!("Unknown command: {command}")),
-            },
+            }
+        }
+    }
+
+    /// `:reload` and `:reload!`: install the current disk contents.
+    ///
+    /// Both take no arguments and fail without touching text, path, history or
+    /// the expected baseline when the file is unnamed, missing, unreadable,
+    /// nonregular or not valid UTF-8. Without `!` a dirty buffer is refused;
+    /// with `!` the local text is replaced as one recoverable undo step. A
+    /// Visual-origin prompt normalizes to Normal only on success.
+    fn reload_file(&mut self, force: bool) {
+        let Some(path) = self.path.clone() else {
+            self.message = Some("No filename; :reload needs a file path".to_owned());
+            return;
+        };
+        if !force && self.is_dirty() {
+            self.message = Some("Unsaved changes; use :reload! to discard them".to_owned());
+            return;
+        }
+        match sample_disk(&path) {
+            DiskProbe::Readable(observation) => {
+                let text = match &observation.contents {
+                    DiskContents::Present(bytes) => {
+                        String::from_utf8(bytes.clone()).expect("probe validated UTF-8")
+                    }
+                    DiskContents::Missing => {
+                        self.message = Some("Reload failed: file was removed from disk".to_owned());
+                        return;
+                    }
+                };
+                let changed = self.install_reload(observation, &text);
+                self.message = Some(if changed {
+                    "Reloaded from disk".to_owned()
+                } else {
+                    "Already up to date".to_owned()
+                });
+            }
+            DiskProbe::NotUtf8(_) => {
+                self.message = Some("Reload failed: contents are not valid UTF-8".to_owned());
+            }
+            DiskProbe::Failed(kind) => {
+                self.message = Some(format!("Reload failed: {}", failure_reason(kind)));
+            }
+        }
+    }
+
+    /// `:format PROGRAM [ARG...]`: run an explicitly chosen formatter over the
+    /// whole editable text or the active Visual selection.
+    ///
+    /// The arguments are split with shell-style quoting but never expanded or
+    /// interpreted, so `|`, `$HOME` and `>` stay literal. Nothing is written to
+    /// disk and the saved baseline is untouched: the replacement is one undoable
+    /// buffer change. A no-op replacement adds no history and keeps the dot
+    /// recipe; any failure leaves text, mode, selection, cursor and history
+    /// exactly as they were.
+    fn format_text(&mut self, arguments: &str) {
+        let Some((program, program_arguments)) = parse_formatter(arguments, &mut self.message)
+        else {
+            return;
+        };
+        let mut formatter =
+            FormatterSpec::new(program.as_str()).args(program_arguments.iter().map(String::as_str));
+        // The formatter runs in the editor's own working directory, declared
+        // explicitly rather than left to whatever the child would inherit.
+        if let Ok(directory) = std::env::current_dir() {
+            formatter = formatter.working_directory(directory);
+        }
+        let (source, selection_start) = match self.selection() {
+            Some(selection) => (
+                TransformSource::from_document(
+                    &self.document,
+                    self.selection_byte_range(selection),
+                ),
+                Some(selection.start),
+            ),
+            None => (
+                TransformSource::whole(self.document.editable_text(), self.document.has_bom()),
+                None,
+            ),
+        };
+        let result = match TransformRequest::new(source, formatter).execute() {
+            Ok(result) => result,
+            Err(error) => {
+                self.message = Some(transform_failure_message(&error));
+                return;
+            }
+        };
+        // The library refuses a result whose source no longer matches, so a
+        // stale application can never splice into the wrong text.
+        let document = match result.apply(&self.document) {
+            Ok(document) => document,
+            Err(error) => {
+                self.message = Some(transform_failure_message(&error));
+                return;
+            }
+        };
+        if result.changed() {
+            self.undo.push(Snapshot {
+                document: std::mem::replace(&mut self.document, document),
+                cursor: self.cursor,
+            });
+            self.redo.clear();
+            // `.` replays key recipes; it must not re-run an external program.
+            self.dot = None;
+        } else {
+            self.document = document;
+        }
+        if let Some(start) = selection_start {
+            self.cursor = start;
+        }
+        self.clamp_cursor_normal();
+        self.mode = EditorMode::Normal;
+        self.visual = None;
+        self.prompt.clear();
+        self.command_return = None;
+        self.search_prompt = None;
+        self.transaction_open = false;
+        self.preferred_visual_column = None;
+        self.parser.reset();
+        // Formatting may take a while, so the file can move underneath it. The
+        // new local text is kept and the difference is surfaced; a later save is
+        // refused by the guard even if polling has not noticed yet.
+        self.mark_possible_external_change();
+        self.message = Some(match result.warnings() {
+            Some(warnings) => format!("Formatted; formatter stderr: {warnings}"),
+            None => "Formatted".to_owned(),
+        });
+    }
+
+    /// Half-open byte range of `selection` in the document's editable text.
+    ///
+    /// A characterwise selection includes its last grapheme, a linewise
+    /// selection includes each selected line's terminator where the file has
+    /// one, and a final line without a terminator stays exact.
+    fn selection_byte_range(&self, selection: Selection) -> ByteRange {
+        let start = self.document.byte_offset(selection.start);
+        let end = match selection.kind {
+            SelectionKind::Characterwise => {
+                let column = self
+                    .document
+                    .grapheme_end(selection.end.row, selection.end.column);
+                self.document
+                    .byte_offset(Cursor::new(selection.end.row, column))
+            }
+            SelectionKind::Linewise => {
+                let next = selection.end.row + 1;
+                if next < self.document.line_count() {
+                    self.document.byte_offset(Cursor::new(next, 0))
+                } else {
+                    self.document.editable_text().len()
+                }
+            }
+        };
+        ByteRange::new(start, end)
+    }
+
+    /// Re-looks at the active file after an external program ran.
+    ///
+    /// This is not a poll: it takes no sample series and applies nothing. It only
+    /// raises the persistent status when the file already differs from the
+    /// baseline, so a formatter run that raced a foreign writer is visible at
+    /// once instead of at the next confirmation.
+    fn mark_possible_external_change(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let Some(expected) = self.disk.as_ref() else {
+            return;
+        };
+        let unchanged =
+            matches!(&sample_disk(&path), DiskProbe::Readable(observed) if observed == expected);
+        self.stable_candidate = None;
+        self.last_sample = None;
+        if unchanged {
+            self.external = None;
+        } else {
+            self.external = Some(
+                if self.is_dirty() {
+                    CONFLICT_STATUS
+                } else {
+                    PENDING_STATUS
+                }
+                .to_owned(),
+            );
         }
     }
 
@@ -1822,22 +2399,6 @@ impl Editor {
             Some(path) => self.save_to(path),
             None => {
                 self.message = Some("No filename; use :w <path>".to_owned());
-                false
-            }
-        }
-    }
-
-    fn save_to(&mut self, path: PathBuf) -> bool {
-        let bytes = self.document.serialize();
-        match storage::save_document(&path, bytes.as_bytes()) {
-            Ok(()) => {
-                self.path = Some(path);
-                self.saved = bytes;
-                self.message = Some("Written".to_owned());
-                true
-            }
-            Err(error) => {
-                self.message = Some(format!("Write failed: {error}"));
                 false
             }
         }
@@ -2046,6 +2607,106 @@ fn write_path_argument(command: &str) -> Option<&str> {
         Some(rest.trim())
     } else {
         None
+    }
+}
+
+/// The argument text of `:format PROGRAM [ARG...]`, without the leading blank.
+///
+/// Only a bare `format` or `format` followed by whitespace is the command, so
+/// `format!` and `formatx` stay unknown commands. `:w PATH` keeps its literal
+/// path grammar and never comes through here.
+fn format_command_text(command: &str) -> Option<&str> {
+    let rest = command.strip_prefix("format")?;
+    if rest.is_empty() {
+        return Some(rest);
+    }
+    rest.starts_with(|ch: char| ch.is_whitespace())
+        .then(|| rest.trim_start())
+}
+
+/// Reads one disk sample without changing anything.
+fn sample_disk(path: &Path) -> DiskProbe {
+    match storage::observe(path) {
+        Ok(observation) => {
+            let valid_utf8 = match &observation.contents {
+                DiskContents::Missing => true,
+                DiskContents::Present(bytes) => std::str::from_utf8(bytes).is_ok(),
+            };
+            if valid_utf8 {
+                DiskProbe::Readable(observation)
+            } else {
+                DiskProbe::NotUtf8(observation)
+            }
+        }
+        Err(error) => DiskProbe::Failed(error.kind()),
+    }
+}
+
+/// Compact reason text for a status line, chosen so the message names the
+/// situation rather than a bare error number.
+fn failure_reason(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::NotFound => "file was removed",
+        io::ErrorKind::PermissionDenied => "permission denied",
+        io::ErrorKind::InvalidInput => "not a regular file",
+        _ => "cannot read the file",
+    }
+}
+
+/// User-facing text for a refused or failed write.
+fn save_failure_message(error: &SaveError) -> String {
+    match error {
+        SaveError::Conflict { .. } => {
+            "Write refused: file changed on disk; use :reload! or :w <path>".to_owned()
+        }
+        SaveError::Io(error) => format!("Write failed: {error}"),
+    }
+}
+
+/// Splits `:format` argument text into a program and its literal arguments.
+///
+/// Shell-style quoting groups words; nothing is expanded, globbed, or handed to
+/// a shell, so `|`, `>`, and `$HOME` reach the program as written. A malformed
+/// quote or an empty invocation leaves a usage message and returns `None`.
+fn parse_formatter(arguments: &str, message: &mut Option<String>) -> Option<(String, Vec<String>)> {
+    if arguments.trim().is_empty() {
+        *message = Some("Usage: :format PROGRAM [ARG...]".to_owned());
+        return None;
+    }
+    let argv = match shell_words::split(arguments) {
+        Ok(argv) => argv,
+        Err(error) => {
+            *message = Some(format!("Invalid formatter arguments: {error}"));
+            return None;
+        }
+    };
+    let Some((program, arguments)) = argv.split_first() else {
+        *message = Some("Usage: :format PROGRAM [ARG...]".to_owned());
+        return None;
+    };
+    if program.is_empty() {
+        *message = Some("Usage: :format PROGRAM [ARG...]".to_owned());
+        return None;
+    }
+    Some((program.clone(), arguments.to_vec()))
+}
+
+/// User-facing text for a transformation that produced nothing applicable,
+/// keeping the useful category before the sanitized formatter diagnostics.
+fn transform_failure_message(error: &TransformError) -> String {
+    let summary = match error {
+        TransformError::InvalidRange { .. } => "Format failed: selection is not a valid byte range",
+        TransformError::Spawn(_) => "Format failed: formatter could not be started",
+        TransformError::Process { .. } => "Format failed: formatter streams failed",
+        TransformError::Exit { .. } => "Format failed: formatter exited unsuccessfully",
+        TransformError::InvalidUtf8Output { .. } => {
+            "Format failed: formatter output was not valid UTF-8"
+        }
+        TransformError::StaleSource => "Format failed: the buffer changed during formatting",
+    };
+    match error.stderr_summary() {
+        Some(diagnostics) => format!("{summary}; {diagnostics}"),
+        None => summary.to_owned(),
     }
 }
 

@@ -10,6 +10,38 @@ use ratatui::style::{Color, Modifier};
 /// Background the renderer uses for Visual selection spans.
 const VISUAL_BACKGROUND: Color = Color::DarkGray;
 
+#[test]
+fn external_change_status_render() {
+    use std::time::{Duration, Instant};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("document");
+    std::fs::write(&path, "original").unwrap();
+    let mut editor = Editor::new(Some(path.clone())).unwrap();
+    editor.handle_input(press('i'));
+    editor.handle_input(press('x'));
+    editor.handle_input(EditorInput::Escape);
+    std::fs::write(&path, "external").unwrap();
+    let now = Instant::now();
+    editor.poll_disk(now);
+    editor.poll_disk(now + Duration::from_millis(500));
+    let status = editor
+        .external_status()
+        .expect("persistent conflict")
+        .to_owned();
+    editor.handle_input(press('h'));
+    assert_eq!(editor.external_status(), Some(status.as_str()));
+    let terminal = render_to(&editor, 160, 3);
+    assert!(row(&terminal, 1).contains(&status));
+    for width in [1, 2, 8, 20] {
+        for height in [1, 2, 3] {
+            let terminal = render_to(&editor, width, height);
+            for y in 0..height {
+                assert!(!row(&terminal, y).contains('\u{1b}'));
+            }
+        }
+    }
+}
+
 const ALL_MODES: [EditorMode; 7] = [
     EditorMode::Normal,
     EditorMode::Insert,

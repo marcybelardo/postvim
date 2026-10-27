@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use postvim::cli::{self, CliAction};
+use postvim::cli::{self, CliAction, FormatStreams};
 use postvim::editor::Editor;
 use postvim::terminal::with_terminal;
 use postvim::ui;
@@ -34,6 +34,26 @@ fn run() -> Result<(), String> {
             })?;
             with_terminal(|terminal| ui::run(terminal, &mut editor))
                 .map_err(|error| error.to_string())
+        }
+        CliAction::Format(invocation) => {
+            // Format mode is independent of the editor and the terminal: no
+            // terminal setup, no TTY requirement, and no document file is
+            // touched unless --write requested it.
+            let working_directory = std::env::current_dir()
+                .map_err(|error| format!("cannot determine the working directory: {error}"))?;
+            let mut stdin = io::stdin().lock();
+            let mut stdout = io::stdout().lock();
+            let mut stderr = io::stderr().lock();
+            cli::run_format(
+                &invocation,
+                &working_directory,
+                FormatStreams {
+                    stdin: &mut stdin,
+                    stdout: &mut stdout,
+                    stderr: &mut stderr,
+                },
+            )
+            .map_err(|error| error.to_string())
         }
     }
 }

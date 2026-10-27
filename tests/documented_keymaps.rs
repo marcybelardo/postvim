@@ -23,12 +23,28 @@ const REQUIRED_KEYS: &str = "\
     d c y dd cc yy p P u Ctrl-r . v V / ? n N : Enter Tab Backspace Delete Left Right \
     Up Down Esc";
 
-/// The complete Ex grammar; only `:w` takes an argument.
-const REQUIRED_EX_COMMANDS: [&str; 6] = [":w", ":w PATH", ":q", ":q!", ":wq", ":x"];
+/// The complete Ex grammar; only `:w` takes a path, and `:format` takes a program
+/// and its arguments. `:reload` and `:reload!` take nothing.
+const REQUIRED_EX_COMMANDS: [&str; 9] = [
+    ":w",
+    ":w PATH",
+    ":q",
+    ":q!",
+    ":wq",
+    ":x",
+    ":format PROGRAM [ARG...]",
+    ":reload",
+    ":reload!",
+];
 
 /// Keys and commands the documentation must call out as unavailable.
 const REQUIRED_UNSUPPORTED: &str = "\
-    di ci yi Ctrl-v \" @ q m R Y J ~ ZZ ZQ gv :s :! :1,$d :wq<path> :x<path> :w! :q!!";
+    di ci yi Ctrl-v \" @ q m R Y J ~ ZZ ZQ gv :s :! :1,$d :wq<path> :x<path> :w! :q!! \
+    :format! :reload<path>";
+
+/// The independent command line grammar that `--help` must spell out.
+const FORMAT_GRAMMAR: &str = "postvim --format [--input PATH] [--range START:END] \
+                              [--write] [--stdout] -- PROGRAM [ARG...]";
 
 /// One executable example from the keymap page.
 struct Scenario {
@@ -319,4 +335,46 @@ fn help_matches_save_exit_contract() {
         AGENTS.contains("docs/keymaps.md"),
         "AGENTS.md must point at the keymap contract"
     );
+}
+
+#[test]
+fn help_and_guides_agree_on_formatting_and_reload() {
+    assert!(
+        HELP.contains(FORMAT_GRAMMAR),
+        "--help must document the independent --format grammar"
+    );
+    for command in [":format", ":reload", ":reload!"] {
+        assert!(HELP.contains(command), "--help must document {command}");
+        assert!(
+            KEYMAP.contains(command),
+            "docs/keymaps.md must document {command}"
+        );
+        assert!(
+            AGENTS.contains(command),
+            "AGENTS.md must document {command}"
+        );
+    }
+    // Polling cadence and the recovery advice are documented contract, not
+    // implementation detail a reader has to discover from the source.
+    for claim in ["500 ms", "save elsewhere"] {
+        assert!(
+            KEYMAP.contains(claim),
+            "docs/keymaps.md must state {claim:?}"
+        );
+        assert!(AGENTS.contains(claim), "AGENTS.md must state {claim:?}");
+    }
+    // The formatter is trusted, and saying so is part of the contract.
+    for claim in ["timeout", "sandbox"] {
+        assert!(
+            HELP.contains(claim),
+            "--help must state that the formatter has no {claim}"
+        );
+        assert!(
+            KEYMAP.contains(claim) || AGENTS.contains(claim),
+            "the guides must state that the formatter has no {claim}"
+        );
+    }
+    // No guide may offer a force-write escape hatch.
+    assert!(KEYMAP.contains(":w!"), "docs/keymaps.md must reject :w!");
+    assert!(AGENTS.contains(":w!"), "AGENTS.md must reject :w!");
 }

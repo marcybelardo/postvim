@@ -1,7 +1,45 @@
 # postvim
 
 A small, single-buffer UTF-8 terminal editor with a bounded subset of Vim-style
-modal editing. See [the key reference](docs/keymaps.md) for supported commands.
+modal editing. See [the key reference](docs/keymaps.md) for supported commands
+and [text transformations](docs/transformations.md) for running one external
+formatter on the buffer or from the command line.
+
+## Formatting
+
+Postvim bundles no formatter and detects none. It runs a program you name on
+standard input and takes its standard output as text, either interactively with
+`:format` or through an independent command line:
+
+```sh
+# Print the full transformed document; the file is not touched.
+postvim --format --input notes.rs -- rustfmt --emit stdout --edition 2024 --color never
+# Read the document from standard input instead of a path:
+postvim --format -- the-formatter --flag < notes.md
+# Save the transformed document back in place, guarded against external changes:
+postvim --format --input notes.rs --write -- rustfmt --emit stdout --edition 2024 --color never
+```
+
+The formatter must already be installed and on `PATH`; rustfmt is the documented
+example, and its `--emit stdout --edition 2024 --color never` flags are what make
+it read standard input, match Postvim's edition, and keep ANSI escapes out of the
+text. Everything after `--` is passed literally as native arguments, with no
+shell, so pipes, globs, variables, and redirections stay literal text unless your
+own shell expands them first.
+
+The full transformed document goes to standard output by default and nothing is
+written. `--write` needs `--input`, atomically replaces that file only if it still
+matches the bytes read before formatting, and prints no document;
+`--write --stdout` saves and also prints. `--range START:END` limits the work to
+a half-open range of zero-based UTF-8 bytes, counted without the file's initial
+BOM. Neither mode needs a terminal.
+
+The formatter is trusted: it runs synchronously with no sandbox, no time or
+memory limit, and no output limit, and its own file or network side effects
+cannot be undone. Prefer finite stdin/stdout tools. Never write
+`postvim notes.txt > notes.txt`: the shell truncates the file before Postvim
+reads it. See [text transformations](docs/transformations.md) for the byte-range
+rules, diagnostics, and the library contract.
 
 ## Development with Nix
 

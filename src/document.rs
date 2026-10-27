@@ -130,6 +130,11 @@ impl Document {
         }
     }
 
+    /// Parses loaded file text, recognizing an initial BOM and removing it from
+    /// the editable text.
+    ///
+    /// Use [`Document::from_editable_text`] for text whose BOM status is already
+    /// known, so a formatter-emitted leading U+FEFF stays editable text.
     pub fn from_text(text: &str) -> Self {
         let bom = text.starts_with('\u{feff}');
         let text = if bom {
@@ -137,6 +142,20 @@ impl Document {
         } else {
             text
         };
+        Self::from_editable_text(text, bom)
+    }
+
+    /// Builds a document from BOM-free editable text plus an explicit BOM flag.
+    ///
+    /// Never strips or infers an initial U+FEFF: a leading U+FEFF in `text` is
+    /// editable text at offset zero, even when `has_bom` is also true.
+    pub fn from_editable_text(text: &str, has_bom: bool) -> Self {
+        let mut document = Self::parse_editable_text(text);
+        document.bom = has_bom;
+        document
+    }
+
+    fn parse_editable_text(text: &str) -> Self {
         let mut lines = Vec::new();
         let mut start = 0;
         let mut i = 0;
@@ -168,23 +187,72 @@ impl Document {
         });
         Self {
             lines,
-            bom,
+            bom: false,
             insertion_ending: first_ending.unwrap_or(LineEnding::Lf),
         }
     }
 
+    /// The document's text without the initial file BOM, byte for byte as it
+    /// would be serialized after a processed write.
+    pub fn editable_text(&self) -> String {
+        let mut text = String::new();
+        self.write_editable_text(&mut text);
+        text
+    }
+
+    fn write_editable_text(&self, text: &mut String) {
+        for line in &self.lines {
+            text.push_str(&line.text);
+            if let Some(ending) = line.ending {
+                text.push_str(ending.as_str());
+            }
+        }
+    }
+
+    /// Serialized file bytes: the initial BOM when present, then editable text.
     pub fn serialize(&self) -> String {
         let mut result = String::new();
         if self.bom {
             result.push('\u{feff}');
         }
-        for line in &self.lines {
-            result.push_str(&line.text);
-            if let Some(ending) = line.ending {
-                result.push_str(ending.as_str());
-            }
-        }
+        self.write_editable_text(&mut result);
         result
+    }
+
+    /// Byte offset of `cursor` into [`Document::editable_text`], counting the
+    /// exact stored terminator of every preceding line.
+    ///
+    /// Out-of-range rows and columns clamp to the nearest position, so the result
+    /// is always a valid offset into the editable text.
+    pub fn byte_offset(&self, cursor: Cursor) -> usize {
+        let row = cursor.row.min(self.lines.len().saturating_sub(1));
+        let mut offset = 0;
+        for line in self.lines.iter().take(row) {
+            offset += line.text.len() + line.ending.map_or(0, |ending| ending.as_str().len());
+        }
+        offset + self.clamp_boundary(row, cursor.column)
+    }
+
+    /// Cursor at or before a byte offset into [`Document::editable_text`].
+    ///
+    /// The column is always on a grapheme boundary and may be the insertion
+    /// boundary at the end of a line. An offset inside a line terminator maps to
+    /// the end of that line, before the terminator; an offset past the end maps to
+    /// the final line's end.
+    pub fn cursor_at_byte_offset(&self, offset: usize) -> Cursor {
+        let mut remaining = offset;
+        for (row, line) in self.lines.iter().enumerate() {
+            if remaining <= line.text.len() {
+                return Cursor::new(row, self.clamp_boundary(row, remaining));
+            }
+            let terminator = line.ending.map_or(0, |ending| ending.as_str().len());
+            if remaining < line.text.len() + terminator {
+                return Cursor::new(row, line.text.len());
+            }
+            remaining -= line.text.len() + terminator;
+        }
+        let last = self.lines.len().saturating_sub(1);
+        Cursor::new(last, self.line_len_bytes(last))
     }
 
     pub fn line_count(&self) -> usize {
@@ -683,4 +751,102 @@ fn split_breaks(text: &str, segments: &mut Vec<String>, terminators: &mut Vec<Li
         }
     }
     segments.push(text[start..].to_owned());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_text_still_recognizes_an_initial_bom() {
+        let document = Document::from_text("\u{feff}hello\nworld");
+        assert!(document.has_bom());
+        assert_eq!(document.line(0), Some("hello"));
+        assert_eq!(document.editable_text(), "hello\nworld");
+        assert_eq!(document.serialize(), "\u{feff}hello\nworld");
+    }
+
+    #[test]
+    fn from_editable_text_never_strips_a_leading_fe_ff() {
+        let document = Document::from_editable_text("\u{feff}hello", false);
+        assert!(!document.has_bom());
+        assert_eq!(document.line(0), Some("\u{feff}hello"));
+        assert_eq!(document.editable_text(), "\u{feff}hello");
+        // The leading U+FEFF is editable text, so serialization adds none.
+        assert_eq!(document.serialize(), "\u{feff}hello");
+    }
+
+    #[test]
+    fn from_editable_text_keeps_the_explicit_bom_flag() {
+        let document = Document::from_editable_text("\u{feff}hello", true);
+        assert!(document.has_bom());
+        assert_eq!(document.editable_text(), "\u{feff}hello");
+        assert_eq!(document.serialize(), "\u{feff}\u{feff}hello");
+    }
+
+    #[test]
+    fn editable_text_preserves_exact_terminators_and_missing_final_newline() {
+        let mixed = "a\r\nb\nc\rd";
+        let document = Document::from_editable_text(mixed, true);
+        assert_eq!(document.editable_text(), mixed);
+        assert_eq!(document.serialize(), format!("\u{feff}{mixed}"));
+        assert_eq!(document.line_count(), 4);
+
+        let trailing_break = Document::from_editable_text("a\n", false);
+        assert_eq!(trailing_break.line_count(), 2);
+        assert_eq!(trailing_break.line(1), Some(""));
+        assert_eq!(trailing_break.editable_text(), "a\n");
+    }
+
+    #[test]
+    fn byte_offset_counts_stored_terminators() {
+        let document = Document::from_editable_text("ab\r\ncd\n\nef", false);
+        assert_eq!(document.line_count(), 4);
+        assert_eq!(document.byte_offset(Cursor::new(0, 0)), 0);
+        assert_eq!(document.byte_offset(Cursor::new(0, 1)), 1);
+        assert_eq!(document.byte_offset(Cursor::new(0, 2)), 2);
+        assert_eq!(document.byte_offset(Cursor::new(1, 0)), 4);
+        assert_eq!(document.byte_offset(Cursor::new(2, 0)), 7);
+        assert_eq!(document.byte_offset(Cursor::new(3, 0)), 8);
+        assert_eq!(document.byte_offset(Cursor::new(3, 2)), 10);
+        // Out-of-range positions clamp to the nearest valid offset.
+        assert_eq!(document.byte_offset(Cursor::new(0, 99)), 2);
+        assert_eq!(document.byte_offset(Cursor::new(99, 0)), 8);
+    }
+
+    #[test]
+    fn cursor_at_byte_offset_maps_graphemes_and_terminators() {
+        let text = "a👩‍👩‍👧‍👦b\r\ncd";
+        let document = Document::from_editable_text(text, false);
+        assert_eq!(text.len(), 31);
+        assert_eq!(document.cursor_at_byte_offset(0), Cursor::new(0, 0));
+        assert_eq!(document.cursor_at_byte_offset(1), Cursor::new(0, 1));
+        // Inside the emoji grapheme: clamped back to its start.
+        assert_eq!(document.cursor_at_byte_offset(5), Cursor::new(0, 1));
+        assert_eq!(document.cursor_at_byte_offset(26), Cursor::new(0, 26));
+        // End of the first line's text, immediately before the CRLF terminator.
+        assert_eq!(document.cursor_at_byte_offset(27), Cursor::new(0, 27));
+        // Inside the CRLF terminator: the end of that line, never a split pair.
+        assert_eq!(document.cursor_at_byte_offset(28), Cursor::new(0, 27));
+        assert_eq!(document.cursor_at_byte_offset(29), Cursor::new(1, 0));
+        assert_eq!(document.cursor_at_byte_offset(31), Cursor::new(1, 2));
+        assert_eq!(document.cursor_at_byte_offset(4096), Cursor::new(1, 2));
+    }
+
+    #[test]
+    fn cursor_and_offset_round_trip_on_editable_boundaries() {
+        let text = "x\r\ny\n\nz";
+        let document = Document::from_editable_text(text, false);
+        for offset in [0, 1, 3, 4, 5, 6, 7] {
+            assert_eq!(
+                document.byte_offset(document.cursor_at_byte_offset(offset)),
+                offset
+            );
+        }
+        assert_eq!(text.len(), 7);
+        let empty = Document::from_editable_text("", true);
+        assert_eq!(empty.editable_text(), "");
+        assert_eq!(empty.serialize(), "\u{feff}");
+        assert_eq!(empty.byte_offset(empty.cursor_at_byte_offset(0)), 0);
+    }
 }

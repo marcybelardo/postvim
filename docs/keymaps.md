@@ -55,9 +55,10 @@ text (so `dq` in Normal mode does nothing at all).
 
 ## Ex commands
 
-The grammar is bounded: `:w`, `:w <path>`, `:q`, `:q!`, `:wq`, `:x`.
-Surrounding whitespace is allowed and only `:w` takes a path. In the block
-below `PATH` is the placeholder for that argument; everything else is literal.
+The grammar is bounded: `:w`, `:w <path>`, `:q`, `:q!`, `:wq`, `:x`,
+`:format <program> [<arg> ...]`, `:reload`, and `:reload!`. Surrounding
+whitespace is allowed. In the block below `PATH` and `PROGRAM [ARG...]` are the
+placeholders for those arguments; everything else is literal.
 
 ```text postvim-ex-commands
 :w
@@ -66,6 +67,9 @@ below `PATH` is the placeholder for that argument; everything else is literal.
 :q!
 :wq
 :x
+:format PROGRAM [ARG...]
+:reload
+:reload!
 ```
 
 - `:w` writes the active path; `:w <path>` writes there and adopts that path
@@ -79,8 +83,124 @@ below `PATH` is the placeholder for that argument; everything else is literal.
   dirty state intact.
 - `:x` writes only when the buffer is modified, then quits. A clean buffer quits
   without writing, and no file is created for a clean unnamed buffer.
+- `:format <program> [<arg> ...]` runs that program on the Visual selection or
+  the whole buffer and applies its output as one undoable change without
+  writing the file. The arguments are split with shell-style quoting; no shell
+  runs, so operators and variables stay literal text.
+- `:reload` replaces a clean buffer with its file's current contents. `:reload!`
+  discards local text for those contents. Both are one undoable change, take no
+  argument, and refuse an unnamed buffer, a missing file, or a file that is not
+  readable regular UTF-8.
 - Any other command, an empty command, and any of `:wq <path>`, `:x <path>`,
-  `:w!`, or `:q!!` are rejected without side effects.
+  `:reload <path>`, `:format` with an empty program or unmatched quotes, `:w!`,
+  or `:q!!` are rejected without side effects.
+
+## Formatting
+
+`:format` runs one existing program that you name; Postvim bundles no formatter,
+guesses none, and formats nothing automatically. The documented real example is
+rustfmt, which must be on `PATH`:
+
+```sh
+# In a terminal reading from standard input:
+printf 'fn main(){println!("hi");}\n' | rustfmt --emit stdout --edition 2024 --color never
+```
+
+Inside Postvim you type `:format rustfmt --emit stdout --edition 2024 --color never`.
+The flags are explicit: `--emit stdout` makes rustfmt read standard input and
+print the result, `--edition 2024` matches the edition Postvim is built with, and
+`--color never` keeps ANSI escapes out of the text. Without those flags rustfmt
+may rewrite files or refuse to format, so they are part of the documented
+invocation rather than optional decoration. A Visual fragment is often not
+valid Rust, and a program that rejects its input is reported as a failure.
+
+- Input is the Visual selection when the prompt was opened from Visual mode, and
+  the whole buffer otherwise. A characterwise selection includes its last
+  grapheme; a linewise selection includes the selected line endings where the
+  file has them, and a last line without a final newline stays exact.
+- The program receives only the selected text on standard input. Its output
+  replaces exactly that slice, so text outside the selection keeps its bytes:
+  mixed line endings, an absent final newline, and an initial UTF-8 BOM survive
+  untouched. The formatted slice itself is whatever the program emitted; there is
+  no trimming, newline repair, or re-indentation.
+- Success is one undoable change and never a write: the file on disk, the saved
+  baseline, and the dirty state are only what the edit itself implies. An output
+  identical to the input adds no undo step and clears nothing. The yank register
+  is untouched, and the cursor returns to the start of the changed range clamped
+  to a grapheme boundary, or to its approximate old position for a whole-buffer
+  run.
+- `.` never re-runs an external program, so a stale repeat is discarded by a
+  successful format.
+- A failure — missing program, nonzero exit, output that is not UTF-8, or an
+  invalid range — keeps the text, cursor, mode, path, dirty state, undo history,
+  and register exactly as they were, and shows the program's diagnostics. A
+  program that succeeds but writes to standard error keeps its warnings visible
+  in the message line; warnings never become text in the buffer.
+- The program is trusted and synchronous. Postvim runs it directly, with no
+  implicit shell and no sandbox. Argument text typed after `:format` is split
+  with shell-style quoting, so quotes group one argument and a backslash escapes
+  the next character, but nothing is expanded: `$HOME`, `|`, `>`, `*`, and `;`
+  are ordinary characters. The program may modify files, use the network, or run
+  for as long as it likes; those side effects are outside Postvim's control and
+  cannot be undone by undo.
+- There is no timeout, no cancellation, no memory limit, and no output limit. The
+  editor accepts no input while the program runs and buffers its output in
+  memory, and a program that leaves children holding its pipes can delay
+  completion indefinitely. Use bounded, finite, trusted
+  standard-input/standard-output tools.
+
+## External changes and recovery
+
+A buffered file can change while Postvim is open, for example because an agent
+or an independent `postvim --format ... --write` run replaced it.
+
+- While a buffer has a path, Postvim re-reads that file about twice a second
+  (every 500 ms) and confirms a change only after two equivalent observations at
+  least one interval apart. This delay is a heuristic that avoids displaying a
+  brief truncated-then-written file; it is not a complete-write guarantee, and no
+  universal end-of-write signal exists.
+- New readable regular UTF-8 contents are installed automatically only while the
+  buffer is clean and in idle Normal mode: no pending count or operator, no
+  Visual selection or open prompt, no Insert session. Otherwise reconciliation is
+  deferred and retried at the next safe boundary; a cached observation is never
+  applied without re-checking the current file.
+- A persistent status field reports an external change, a deferred change, or an
+  unreadable file, and it stays visible until the situation is resolved; it is
+  separate from the transient message line.
+- An automatic or explicit reload is one undoable change: the reloaded bytes
+  become the saved baseline and the expected on-disk contents, undo and redo
+  still step through older changes, and undo never writes the file. Repeating a
+  check that finds identical contents adds no history entry and clears no redo.
+- Deletion, invalid UTF-8, a nonregular replacement, an unreadable destination, or
+  a dangling link keeps the last good buffer and baseline even when the buffer is
+  clean, and reports the problem instead of showing an empty buffer. A named file
+  that was missing and has appeared with valid text is a real change and may
+  reload.
+- A dirty buffer keeps its text, cursor, mode, selection, Insert session, undo
+  history, register, and saved baseline. The status field reports the conflict
+  and the ways out: `:reload` after discarding local edits, `:reload!` to discard
+  them explicitly, or a save elsewhere with `:w <other-path>`.
+- Every route that writes the active file — `:w`, `:wq`, `:x` on a modified
+  buffer, and `:w <path>` when the path resolves to the same file — first
+  compares the destination against the contents Postvim last read or wrote, and
+  compares again immediately before the atomic replacement. A difference refuses
+  the write and leaves the foreign bytes, the buffer, the path, and the dirty
+  state intact. Lexical aliases (`./notes.txt`), absolute paths, and symlinks
+  pointing at the same target do not bypass that check.
+- There is no force-overwrite flag and no merge: `:w!` stays unsupported, and
+  recovery is an explicit reload, an explicit discard, or a save elsewhere. A
+  save to a genuinely different destination keeps its documented behavior of
+  replacing that destination; it is a save-as, not a claim that the old file was
+  unchanged.
+- These checks are optimistic: they reduce lost updates but are not file locking
+  or an atomic compare-and-swap, and an arbitrary writer can still change the
+  destination between the last comparison and the rename. Ownership, ACLs,
+  extended attributes, hard-link identity, power-loss durability, and network
+  filesystem consistency are not promised.
+- Never redirect the editor onto the file it is editing. The shell truncates
+  `postvim notes.txt > notes.txt` before Postvim reads it, so the buffer is empty
+  before polling or save checks can help. Have agents and tools replace files
+  atomically, or write a different path.
 
 ## Deliberately unsupported
 
@@ -104,10 +224,13 @@ gv | reselecting the previous Visual selection
 :! | Ex shell commands
 :1,$d | Ex ranges and line numbers
 :wq<path> :x<path> :w! :q!! | rejected command grammar
+:format! :reload<path> | rejected command grammar
 ```
 
 There is also no autoindent, no multiple buffers, no configuration, no plugin
-host, and no Windows terminal claim.
+host, no bundled or auto-detected formatter, no format-on-save, no asynchronous
+formatting job or cancellation, no automatic merge, and no Windows terminal
+claim.
 
 ## Interpretation rules and deviations
 
@@ -128,7 +251,8 @@ than copying Vim exactly:
 - **Byte-exact saved baseline.** Dirty means the serialized bytes differ from
   the bytes last opened or last written successfully. Undoing back to those
   bytes makes the buffer clean again, and a failed write never moves the
-  baseline.
+  baseline. A reload moves it to the bytes just read, and `:format` never moves
+  it because formatting does not write.
 - **Repeat is semantic.** `.` re-runs the last change at the current cursor
   rather than replaying recorded keys at an absolute position, and a Visual
   change repeats the selection's shape (line count, or inclusive grapheme
@@ -153,6 +277,16 @@ than copying Vim exactly:
   lines. Reselecting a previous selection with a count or `gv` is not supported.
 - **Reversed selections normalize.** A backwards selection is recorded forward
   before it is applied or remembered for `.`.
+- **External changes are observations, not locks.** An external edit is detected
+  by comparing bytes at a resolved path, not by watching filesystem objects or
+  holding them. Identical bytes count as unchanged even when the file was
+  replaced, and a foreign edit reverted to the expected contents clears the
+  conflict. Seeing bytes that happen to equal local unsaved edits does not mark
+  the buffer saved.
+- **Formatting is explicit and trusted.** `:format` starts exactly the program
+  you named with the arguments you typed and no shell in between. Postvim adds no
+  filename, reads no project configuration, and cannot bound the program's time,
+  memory, or side effects. It also never runs a formatter on its own.
 
 ## Newly inserted line breaks
 
@@ -197,9 +331,13 @@ cargo run -- notes.txt   # then: cworld<Esc>, u, then :wq
 
 ```sh
 cargo test --test documented_keymaps
+cargo test --test documented_transformations
 python3 tests/terminal_smoke.py target/debug/postvim
 ```
 
 `cargo test` runs the inventory, help, and example checks above plus the editor,
-render, and filesystem suites. The PTY harness drives real keystrokes, including
-CR for Enter and Ctrl-r for redo, and asserts the exact bytes on disk.
+render, and filesystem suites. The transformation examples in
+[docs/transformations.md](transformations.md) are executed by
+`tests/documented_transformations.rs`, so the command grammar and the recovery
+advice cannot drift either. The PTY harness drives real keystrokes, including CR
+for Enter and Ctrl-r for redo, and asserts the exact bytes on disk.

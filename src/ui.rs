@@ -1,4 +1,5 @@
 use std::io;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::cursor::SetCursorStyle;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -77,15 +78,34 @@ pub fn run(
     terminal: &mut Terminal<impl ratatui::backend::Backend<Error = io::Error>>,
     editor: &mut Editor,
 ) -> io::Result<()> {
+    let interval = Duration::from_millis(500);
+    let mut deadline = Instant::now() + interval;
+    let mut redraw = true;
     loop {
-        execute!(io::stdout(), cursor_style(editor.mode()))?;
-        terminal.draw(|frame| render(frame, editor))?;
+        if redraw {
+            execute!(io::stdout(), cursor_style(editor.mode()))?;
+            terminal.draw(|frame| render(frame, editor))?;
+            redraw = false;
+        }
         if editor.should_quit() {
             return Ok(());
         }
 
-        if let Some(input) = map_event(event::read()?, editor.mode()) {
-            editor.handle_input(input);
+        let now = Instant::now();
+        if now >= deadline {
+            redraw |= editor.poll_disk(now);
+            deadline = now + interval;
+            continue;
+        }
+        if event::poll(deadline.saturating_duration_since(now))? {
+            let event = event::read()?;
+            if matches!(event, Event::Resize(_, _)) {
+                redraw = true;
+            }
+            if let Some(input) = map_event(event, editor.mode()) {
+                editor.handle_input(input);
+                redraw = true;
+            }
         }
     }
 }
@@ -365,8 +385,12 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     let marker = if editor.is_dirty() { " [+]" } else { "" };
     let cursor = editor.cursor();
     let col = visual_column(editor.document(), cursor.row, cursor.column).saturating_add(1);
+    let external = editor
+        .external_status()
+        .map(|text| format!(" [{}]", sanitize(text)))
+        .unwrap_or_default();
     let mut status = format!(
-        " {}  {name}{marker}  {}:{}",
+        " {}{external}  {name}{marker}  {}:{}",
         editor.mode().label(),
         cursor.row + 1,
         col
