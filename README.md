@@ -41,6 +41,19 @@ cannot be undone. Prefer finite stdin/stdout tools. Never write
 reads it. See [text transformations](docs/transformations.md) for the byte-range
 rules, diagnostics, and the library contract.
 
+## Saved-file context
+
+Print a plain-text report for a 1-based inclusive line range in the currently
+saved file, with up to three surrounding lines by default:
+
+```sh
+postvim --context --lines 2:3 -- notes.txt
+```
+
+This read-only command does not see unsaved editor changes or provide an editing
+or insertion interface. See [saved-file context](docs/context.md) for its exact
+output, escaping, and limits.
+
 ## Development with Nix
 
 With Nix installed and the `nix-command` and `flakes` experimental features enabled:

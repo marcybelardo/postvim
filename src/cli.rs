@@ -14,6 +14,22 @@ pub enum CliAction {
     Version,
     Edit(Option<PathBuf>),
     Format(FormatInvocation),
+    Context(ContextInvocation),
+}
+
+/// A 1-based inclusive range of document lines, not UTF-8 byte offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// A read-only report from one saved file, independent of editor state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextInvocation {
+    pub path: PathBuf,
+    pub lines: LineRange,
+    pub surrounding_lines: usize,
 }
 
 /// A half-open UTF-8 byte range into BOM-free editable document text.
@@ -58,6 +74,15 @@ impl FormatInvocation {
 pub const HELP: &str = "Postvim — a small modal text editor\n\
 Usage: postvim [--help | --version] [--] [PATH]\n\
        postvim --format [--input PATH] [--range START:END] [--write] [--stdout] -- PROGRAM [ARG...]\n\
+\n\
+Context mode: postvim --context --lines START:END [--surround N] -- PATH\n\
+Reads only a saved file on disk, not live editor state; it does not discover\n\
+dirty buffers or highlights. --context is recognized only as the first argument.\n\
+--lines is mandatory: 1-based inclusive line numbers, not --format byte offsets.\n\
+--surround defaults to 3 and accepts 0 through 20; options may be in either order.\n\
+-- and exactly one nonempty native PATH are required; '-' is a literal filename.\n\
+The numbered report escapes controls and backslashes; it is not lossless file\n\
+serialization. It never reads stdin, needs no terminal, and does not write files.\n\
 \n\
 Open PATH, or show the welcome screen when no path is supplied. A missing PATH\n\
 will not be created until it is saved with :w. Use -- before a path beginning\n\
@@ -118,6 +143,9 @@ where
         return Ok(CliAction::Edit(None));
     };
 
+    if first == OsStr::new("--context") {
+        return parse_context(args);
+    }
     if first == OsStr::new("--format") {
         return parse_format(args);
     }
@@ -143,6 +171,62 @@ where
         )),
         _ => parse_path(Some(first), args.next()),
     }
+}
+
+fn parse_context<I: Iterator<Item = OsString>>(mut args: I) -> Result<CliAction, String> {
+    let mut lines = None;
+    let mut surround = None;
+    loop {
+        let option = args.next().ok_or("--context requires -- before PATH")?;
+        match option.to_str() {
+            Some("--") => break,
+            Some("--lines") => {
+                if lines.is_some() {
+                    return Err("--lines may be given only once".into());
+                }
+                let value = args.next().ok_or("--lines requires START:END")?;
+                let text = value.to_str().ok_or("--lines must be valid Unicode")?;
+                let (start, end) = text.split_once(':').ok_or("--lines requires START:END")?;
+                let start = context_number(start, "--lines")?;
+                let end = context_number(end, "--lines")?;
+                if start == 0 || start > end {
+                    return Err("--lines requires positive 1-based START <= END".into());
+                }
+                lines = Some(LineRange { start, end });
+            }
+            Some("--surround") => {
+                if surround.is_some() {
+                    return Err("--surround may be given only once".into());
+                }
+                let value = args.next().ok_or("--surround requires N")?;
+                let text = value.to_str().ok_or("--surround must be valid Unicode")?;
+                let number = context_number(text, "--surround")?;
+                if number > 20 {
+                    return Err("--surround must be between 0 and 20".into());
+                }
+                surround = Some(number);
+            }
+            Some(unknown) => return Err(format!("unknown --context option: {unknown}")),
+            None => return Err("--context options must be valid Unicode".into()),
+        }
+    }
+    let lines = lines.ok_or("--context requires --lines START:END")?;
+    let path = args.next().ok_or("--context requires one PATH after --")?;
+    if path.is_empty() || args.next().is_some() {
+        return Err("--context requires exactly one nonempty PATH after --".into());
+    }
+    Ok(CliAction::Context(ContextInvocation {
+        path: PathBuf::from(path),
+        lines,
+        surrounding_lines: surround.unwrap_or(3),
+    }))
+}
+
+fn context_number(text: &str, option: &str) -> Result<usize, String> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{option} requires ASCII decimal numbers"));
+    }
+    text.parse().map_err(|_| format!("{option} number is too large"))
 }
 
 /// Parse the options that follow a leading `--format`.

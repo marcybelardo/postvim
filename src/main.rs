@@ -7,10 +7,18 @@ use postvim::terminal::with_terminal;
 use postvim::ui;
 
 fn main() -> ExitCode {
+    // Context owns a separate diagnostic boundary: its raw errors are escaped
+    // once, while existing editor and formatter diagnostics retain their style.
+    let context = std::env::args_os().nth(1).is_some_and(|arg| arg == "--context");
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            let _ = writeln!(io::stderr().lock(), "postvim: {}", sanitize(&message));
+            let message = if context {
+                postvim::context::escape(&message)
+            } else {
+                sanitize(&message)
+            };
+            let _ = writeln!(io::stderr().lock(), "postvim: {message}");
             ExitCode::FAILURE
         }
     }
@@ -26,6 +34,9 @@ fn run() -> Result<(), String> {
         CliAction::Version => {
             println!("postvim {}", env!("CARGO_PKG_VERSION"));
             Ok(())
+        }
+        CliAction::Context(invocation) => {
+            postvim::context::run_context(&invocation, &mut io::stdout().lock())
         }
         CliAction::Edit(path) => {
             let mut editor = Editor::new(path.clone()).map_err(|error| match path {

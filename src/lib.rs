@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod context;
 pub mod document;
 pub mod editor;
 pub mod keymap;

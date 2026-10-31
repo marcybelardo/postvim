@@ -120,6 +120,31 @@ destination first; no polling or save check can recover it. Write another path,
 or use `postvim --format --input notes.txt --write -- ...` for a guarded in-place
 replacement.
 
+## Saved-file context
+
+The independent, read-only `--context` command prints selected lines from the
+currently readable saved file, without starting the editor:
+
+```sh
+postvim --context --lines START:END [--surround N] -- PATH
+```
+
+`--context` must be first. Both `--lines` and `--` are mandatory, and the line
+and surrounding-line options may appear in either order. Supply exactly one
+nonempty native path after `--`; `-` names an ordinary file. Lines are 1-based
+and inclusive (unlike `--format --range`, which counts zero-based half-open UTF-8
+bytes). The surrounding-line count defaults to 3 and must be 0 through 20.
+
+This reports disk contents only: it cannot see unsaved changes, highlights, or
+live editor state, and does not check whether the editor has unsaved changes.
+Save first when needed. It is not an editing, saving, or insertion interface.
+The report escapes backslashes, tabs, and other control characters, preserves
+Unicode, and uses LF as structural output; it is not a lossless export. Missing,
+unreadable, non-regular, invalid-UTF-8, and invalid-range inputs fail with a
+nonzero status and diagnostics on standard error, with no report on standard
+output. An output error may occur after partial output. See
+[docs/context.md](docs/context.md) for the exact report and example.
+
 ## Text and save behavior
 
 The document is an in-memory UTF-8 string; extremely large files are not optimized. Cursor movement and deletion use extended graphemes. Tabs have fixed four-cell stops. Terminal emoji widths may vary. Content scrolls without wrapping, and control characters are displayed safely rather than emitted to the terminal.

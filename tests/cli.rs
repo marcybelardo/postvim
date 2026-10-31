@@ -11,6 +11,61 @@ fn parse(args: &[&str]) -> Result<CliAction, String> {
     parse_args_os(args.iter().map(OsString::from))
 }
 
+#[test]
+fn context_argument_grammar() {
+    use postvim::cli::{ContextInvocation, LineRange};
+    for (options, expected) in [
+        (vec!["--lines", "1:2"], 3),
+        (vec!["--lines", "01:2", "--surround", "0"], 0),
+        (vec!["--surround", "20", "--lines", "1:2"], 20),
+    ] {
+        let mut args = vec!["--context"];
+        args.extend(options);
+        args.extend(["--", "-"]);
+        assert_eq!(parse(&args).unwrap(), CliAction::Context(ContextInvocation {
+            path: PathBuf::from("-"), lines: LineRange { start: 1, end: 2 }, surrounding_lines: expected,
+        }));
+    }
+    for options in [
+        vec![], vec!["--", "p"], vec!["--lines"], vec!["--lines", "1:1"],
+        vec!["--lines", "1:1", "--"], vec!["--lines", "1:1", "--", ""],
+        vec!["--lines", "1:1", "--", "p", "q"],
+        vec!["--lines", "1:1", "--lines", "1:1", "--", "p"],
+        vec!["--lines", "1:1", "--surround", "0", "--surround", "1", "--", "p"],
+        vec!["--unknown", "--", "p"], vec!["--surround"],
+    ] {
+        let mut args = vec!["--context"];
+        args.extend(options);
+        assert!(parse(&args).is_err(), "{args:?}");
+    }
+    for value in ["0:1", "2:1", "1:0", "1", "1:2:3", ":1", "1:", "-1:2", "+1:2", " 1:2", "١:2", "1:２", "184467440737095516160:2"] {
+        assert!(parse(&["--context", "--lines", value, "--", "p"]).is_err(), "{value}");
+    }
+    for value in ["21", "-1", "+1", "", "١", " 1", "184467440737095516160"] {
+        assert!(parse(&["--context", "--lines", "1:1", "--surround", value, "--", "p"]).is_err());
+    }
+    let maximum = format!("{}:{}", usize::MAX, usize::MAX);
+    assert!(parse(&["--context", "--lines", &maximum, "--", "p"]).is_ok());
+}
+
+#[test]
+fn context_preserves_existing_launch_grammar() {
+    assert_eq!(parse(&["context"]).unwrap(), CliAction::Edit(Some("context".into())));
+    assert_eq!(parse(&["--", "--context"]).unwrap(), CliAction::Edit(Some("--context".into())));
+    assert!(parse(&["p", "--context"]).is_err());
+    assert!(matches!(parse(&["--format", "--", "--context"]).unwrap(), CliAction::Format(_)));
+    #[cfg(unix)] {
+        use std::os::unix::ffi::OsStringExt;
+        let native = OsString::from_vec(vec![0xff]);
+        for option in ["--lines", "--surround"] {
+            assert!(parse_os(vec!["--context".into(), option.into(), native.clone(), "--".into(), "p".into()]).is_err());
+        }
+        let action = parse_os(vec!["--context".into(), "--lines".into(), "1:1".into(), "--".into(), native.clone()]).unwrap();
+        let CliAction::Context(invocation) = action else { panic!() };
+        assert_eq!(invocation.path.as_os_str(), native);
+    }
+}
+
 fn parse_os(args: Vec<OsString>) -> Result<CliAction, String> {
     parse_args_os(args)
 }
@@ -372,10 +427,14 @@ fn help_output_is_the_shared_text() {
         "--help must print the shared help text unchanged"
     );
     assert!(!stdout.contains(&0x1b));
+    assert!(String::from_utf8(stdout).unwrap().contains("postvim --context --lines START:END"));
 }
 
 #[test]
 fn help_documents_bounded_commands() {
+    for text in ["--context", "--surround", "saved file on disk", "not live editor state", "dirty buffers or highlights", "not lossless", "1-based inclusive", "byte offsets"] {
+        assert!(postvim::cli::HELP.contains(text), "help must document {text}");
+    }
     for command in [":w", ":w PATH", ":q", ":q!", ":wq", ":x"] {
         assert!(
             postvim::cli::HELP.contains(command),
